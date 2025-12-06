@@ -36,7 +36,6 @@ def get_stats_tensor(stats_json):
             stats_tensor[name][key] = torch.from_numpy(np.array(stats_json[name][key]))
     return stats_tensor
 
-
 def multi_image_get_item(
     raw_target: Dict[str, Any],
     img_transform,
@@ -54,33 +53,62 @@ def multi_image_get_item(
     image_size=448,
 ):
     images, num_tiles = [], []
-    num_image = 0
+    num_image = 0  # now: number of <image> tokens (i.e. original frames)
+
     for cam_key in cam_keys:
-        if cam_key in raw_target:
+        if cam_key not in raw_target:
+            continue
+
+        val = raw_target[cam_key]
+
+        # --- NEW: support list of frames per camera key ---
+        # case 1: a sequence of PIL images (demos + current)
+        if isinstance(val, list):
+            for img in val:
+                num_image += 1
+                if dynamic_image_size:
+                    tiles = dynamic_preprocess(
+                        img,
+                        min_num=min_dynamic_patch,
+                        max_num=max_dynamic_patch,
+                        image_size=image_size,
+                        use_thumbnail=use_thumbnail,
+                    )
+                    images += tiles               # extend with tiles
+                    num_tiles.append(len(tiles))  # tiles belong to one <image> token
+                else:
+                    images.append(img)
+                    num_tiles.append(1)
+
+        # case 2: a single PIL image (original behavior)
+        else:
             num_image += 1
             if dynamic_image_size:
-                image = dynamic_preprocess(
-                    raw_target[cam_key],
+                tiles = dynamic_preprocess(
+                    val,
                     min_num=min_dynamic_patch,
                     max_num=max_dynamic_patch,
                     image_size=image_size,
                     use_thumbnail=use_thumbnail,
                 )
-                images += image
-                num_tiles.append(len(image))
+                images += tiles
+                num_tiles.append(len(tiles))
             else:
-                images.append(raw_target[cam_key])
+                images.append(val)
                 num_tiles.append(1)
 
     pixel_values = [img_transform(image) for image in images]
     pixel_values = torch.stack(pixel_values)
     num_patches = pixel_values.size(0)
 
-    # Preprocess the conversations and generate the return dictionary
     num_image_tokens = [num_image_token * num_tile for num_tile in num_tiles]
+
     ntp_target = raw_target.get("ntp_target", "")
     conversation = [
-        {"from": "human", "value": f"{'<image>'*num_image}{raw_target['final_prompt']}"},
+        {
+            "from": "human",
+            "value": f"{'<image>' * num_image}{raw_target['final_prompt']}",
+        },
         {"from": "gpt", "value": ntp_target},
     ]
     ret = preprocess_internvl2_5(
@@ -92,13 +120,14 @@ def multi_image_get_item(
         group_by_length=True,
     )
 
-    # Calculate position_ids for packed dataset
     position_ids = ret["attention_mask"].long().cumsum(-1) - 1
     position_ids.masked_fill_(ret["attention_mask"] == 0, 1)
-    image_end_token_id = text_tokenizer.convert_tokens_to_ids(IMG_END_TOKEN)
-    assert (ret["input_ids"][0] == image_end_token_id).sum() == num_image, "image tokens are truncated"
 
-    # Create the final return dictionary
+    image_end_token_id = text_tokenizer.convert_tokens_to_ids(IMG_END_TOKEN)
+    assert (
+        ret["input_ids"][0] == image_end_token_id
+    ).sum() == num_image, "image tokens are truncated"
+
     final_ret = dict(
         input_ids=ret["input_ids"][0],
         labels=ret["labels"][0],
@@ -183,16 +212,30 @@ class GO1Infer:
         return outputs
 
     def inference(self, payload: Dict[str, Any]):
+          # --- Build visual sequence for top camera ---
+        demo_top_frames = payload.get("demo_top", [])  # list of HxWx3 uint8 arrays
+        demo_imgs = [Image.fromarray(arr) for arr in demo_top_frames]
+        
         if "top" in payload:
-            payload["cam_head_color"] = Image.fromarray(payload["top"])
+            payload["cam_head_color"] = demo_imgs + [Image.fromarray(payload["top"])]
         if "right" in payload:
             payload["cam_hand_right_color"] = Image.fromarray(payload["right"])
         if "left" in payload:
             payload["cam_hand_left_color"] = Image.fromarray(payload["left"])
+            
 
         prompt = payload["instruction"]
-        payload["final_prompt"] = f"What action should the robot take to {prompt}?"
-
+        
+        if demo_imgs:
+            payload["final_prompt"] = (
+                "You see a sequence of images from the robot's camera.\n"
+                "The FIRST images are from past successful episodes performing similar tasks.\n"
+                "The LAST 3 images show the CURRENT state.\n"
+                f"What action should the robot take to {prompt}?"
+            )
+        else:
+            payload["final_prompt"] = f"What action should the robot take to {prompt}?"
+        
         inputs = multi_image_get_item(
             raw_target=payload,
             img_transform=self.img_transform,
